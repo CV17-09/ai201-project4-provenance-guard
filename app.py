@@ -1,5 +1,7 @@
 import json
 import os
+import re
+import string
 import uuid
 from datetime import datetime, timezone
 
@@ -26,6 +28,10 @@ LOG_FILE = "audit_log.jsonl"
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def clamp_score(score):
+    return max(0.0, min(1.0, float(score)))
 
 
 def classify_with_groq(text):
@@ -77,14 +83,112 @@ Text:
             "reason": "Model did not return valid JSON."
         }
 
-    result["llm_score"] = float(result.get("llm_score", 0.5))
-
-    if result["llm_score"] < 0:
-        result["llm_score"] = 0.0
-    elif result["llm_score"] > 1:
-        result["llm_score"] = 1.0
-
+    result["llm_score"] = clamp_score(result.get("llm_score", 0.5))
     return result
+
+
+def split_sentences(text):
+    sentences = re.split(r"[.!?]+", text)
+    return [sentence.strip() for sentence in sentences if sentence.strip()]
+
+
+def tokenize_words(text):
+    return re.findall(r"\b\w+\b", text.lower())
+
+
+def calculate_variance(values):
+    if len(values) < 2:
+        return 0.0
+
+    mean = sum(values) / len(values)
+    return sum((value - mean) ** 2 for value in values) / len(values)
+
+
+def stylometric_signal(text):
+    sentences = split_sentences(text)
+    words = tokenize_words(text)
+
+    word_count = len(words)
+    sentence_count = len(sentences)
+
+    if word_count == 0 or sentence_count == 0:
+        return {
+            "stylometric_score": 0.5,
+            "features": {
+                "word_count": word_count,
+                "sentence_count": sentence_count,
+                "average_sentence_length": 0,
+                "sentence_length_variance": 0,
+                "type_token_ratio": 0,
+                "punctuation_density": 0
+            },
+            "reason": "Not enough text to calculate stylometric features."
+        }
+
+    sentence_lengths = [len(tokenize_words(sentence)) for sentence in sentences]
+    average_sentence_length = sum(sentence_lengths) / sentence_count
+    sentence_length_variance = calculate_variance(sentence_lengths)
+
+    unique_words = set(words)
+    type_token_ratio = len(unique_words) / word_count
+
+    punctuation_count = sum(1 for char in text if char in string.punctuation)
+    punctuation_density = punctuation_count / max(len(text), 1)
+
+    # Heuristic scoring:
+    # AI text often has more uniform sentence length,
+    # lower punctuation variety, and smoother vocabulary patterns.
+    uniform_sentence_score = 1.0 - min(sentence_length_variance / 50, 1.0)
+
+    vocabulary_score = 1.0 - min(type_token_ratio / 0.85, 1.0)
+
+    punctuation_score = 1.0 - min(punctuation_density / 0.08, 1.0)
+
+    length_score = min(average_sentence_length / 25, 1.0)
+
+    stylometric_score = (
+        0.35 * uniform_sentence_score +
+        0.25 * vocabulary_score +
+        0.20 * punctuation_score +
+        0.20 * length_score
+    )
+
+    return {
+        "stylometric_score": round(clamp_score(stylometric_score), 3),
+        "features": {
+            "word_count": word_count,
+            "sentence_count": sentence_count,
+            "average_sentence_length": round(average_sentence_length, 3),
+            "sentence_length_variance": round(sentence_length_variance, 3),
+            "type_token_ratio": round(type_token_ratio, 3),
+            "punctuation_density": round(punctuation_density, 3)
+        },
+        "reason": "Stylometric score based on sentence uniformity, vocabulary diversity, punctuation density, and average sentence length."
+    }
+
+
+def combine_scores(llm_score, stylometric_score):
+    combined_score = (0.60 * llm_score) + (0.40 * stylometric_score)
+    return round(clamp_score(combined_score), 3)
+
+
+def get_label_and_attribution(confidence):
+    if confidence <= 0.39:
+        return {
+            "attribution": "likely_human",
+            "label": "Likely Human-Written"
+        }
+
+    if confidence <= 0.69:
+        return {
+            "attribution": "uncertain",
+            "label": "Uncertain"
+        }
+
+    return {
+        "attribution": "likely_ai",
+        "label": "Likely AI-Assisted"
+    }
 
 
 def write_log(entry):
@@ -128,13 +232,17 @@ def submit():
 
     content_id = str(uuid.uuid4())
 
-    signal_result = classify_with_groq(text)
+    llm_result = classify_with_groq(text)
+    stylometric_result = stylometric_signal(text)
 
-    attribution = signal_result.get("attribution", "uncertain")
-    llm_score = signal_result.get("llm_score", 0.5)
+    llm_score = llm_result.get("llm_score", 0.5)
+    stylometric_score = stylometric_result.get("stylometric_score", 0.5)
 
-    confidence = llm_score
-    label = "Placeholder label - final labels added in Milestone 5"
+    confidence = combine_scores(llm_score, stylometric_score)
+    label_result = get_label_and_attribution(confidence)
+
+    attribution = label_result["attribution"]
+    label = label_result["label"]
 
     log_entry = {
         "content_id": content_id,
@@ -143,6 +251,7 @@ def submit():
         "attribution": attribution,
         "confidence": confidence,
         "llm_score": llm_score,
+        "stylometric_score": stylometric_score,
         "status": "classified"
     }
 
@@ -154,10 +263,18 @@ def submit():
         "attribution": attribution,
         "confidence": confidence,
         "label": label,
-        "signal_1": {
-            "name": "groq_llm_classification",
-            "llm_score": llm_score,
-            "reason": signal_result.get("reason", "")
+        "signals": {
+            "signal_1": {
+                "name": "groq_llm_classification",
+                "llm_score": llm_score,
+                "reason": llm_result.get("reason", "")
+            },
+            "signal_2": {
+                "name": "stylometric_heuristics",
+                "stylometric_score": stylometric_score,
+                "features": stylometric_result.get("features", {}),
+                "reason": stylometric_result.get("reason", "")
+            }
         }
     })
 
