@@ -18,7 +18,8 @@ app = Flask(__name__)
 limiter = Limiter(
     get_remote_address,
     app=app,
-    default_limits=["100 per hour"]
+    default_limits=[],
+    storage_uri="memory://"
 )
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
@@ -135,15 +136,9 @@ def stylometric_signal(text):
     punctuation_count = sum(1 for char in text if char in string.punctuation)
     punctuation_density = punctuation_count / max(len(text), 1)
 
-    # Heuristic scoring:
-    # AI text often has more uniform sentence length,
-    # lower punctuation variety, and smoother vocabulary patterns.
     uniform_sentence_score = 1.0 - min(sentence_length_variance / 50, 1.0)
-
     vocabulary_score = 1.0 - min(type_token_ratio / 0.85, 1.0)
-
     punctuation_score = 1.0 - min(punctuation_density / 0.08, 1.0)
-
     length_score = min(average_sentence_length / 25, 1.0)
 
     stylometric_score = (
@@ -172,22 +167,38 @@ def combine_scores(llm_score, stylometric_score):
     return round(clamp_score(combined_score), 3)
 
 
-def get_label_and_attribution(confidence):
+def generate_transparency_label(confidence):
     if confidence <= 0.39:
         return {
             "attribution": "likely_human",
-            "label": "Likely Human-Written"
+            "label": "Likely Human-Written",
+            "label_text": (
+                "Likely Human-Written: This text contains writing characteristics "
+                "that are more consistent with human authorship. Limited evidence "
+                "of AI assistance was detected. This result is probabilistic and "
+                "should not be treated as a guarantee."
+            )
         }
 
     if confidence <= 0.69:
         return {
             "attribution": "uncertain",
-            "label": "Uncertain"
+            "label": "Uncertain",
+            "label_text": (
+                "Uncertain: The system detected mixed evidence and cannot confidently "
+                "determine whether AI assistance was used. Human review or an appeal "
+                "may be appropriate."
+            )
         }
 
     return {
         "attribution": "likely_ai",
-        "label": "Likely AI-Assisted"
+        "label": "Likely AI-Assisted",
+        "label_text": (
+            "Likely AI-Assisted: This text contains multiple characteristics commonly "
+            "associated with AI-generated writing. This result is probabilistic and "
+            "should not be treated as proof."
+        )
     }
 
 
@@ -196,7 +207,7 @@ def write_log(entry):
         file.write(json.dumps(entry) + "\n")
 
 
-def get_log(limit=10):
+def get_log(limit=20):
     if not os.path.exists(LOG_FILE):
         return []
 
@@ -204,6 +215,16 @@ def get_log(limit=10):
         lines = file.readlines()
 
     return [json.loads(line) for line in lines[-limit:]]
+
+
+def find_latest_submission(content_id):
+    entries = get_log(limit=1000)
+
+    for entry in reversed(entries):
+        if entry.get("content_id") == content_id and entry.get("event_type") == "submission":
+            return entry
+
+    return None
 
 
 @app.route("/", methods=["GET"])
@@ -214,7 +235,7 @@ def home():
 
 
 @app.route("/submit", methods=["POST"])
-@limiter.limit("20 per minute")
+@limiter.limit("10 per minute;100 per day")
 def submit():
     data = request.get_json()
 
@@ -239,20 +260,25 @@ def submit():
     stylometric_score = stylometric_result.get("stylometric_score", 0.5)
 
     confidence = combine_scores(llm_score, stylometric_score)
-    label_result = get_label_and_attribution(confidence)
+    label_result = generate_transparency_label(confidence)
 
     attribution = label_result["attribution"]
-    label = label_result["label"]
 
     log_entry = {
+        "event_type": "submission",
         "content_id": content_id,
         "creator_id": creator_id,
         "timestamp": utc_now(),
+        "status": "classified",
+        "appeal_filed": False,
         "attribution": attribution,
         "confidence": confidence,
+        "label": label_result["label"],
+        "label_text": label_result["label_text"],
         "llm_score": llm_score,
         "stylometric_score": stylometric_score,
-        "status": "classified"
+        "llm_reason": llm_result.get("reason", ""),
+        "stylometric_features": stylometric_result.get("features", {})
     }
 
     write_log(log_entry)
@@ -260,9 +286,12 @@ def submit():
     return jsonify({
         "content_id": content_id,
         "creator_id": creator_id,
+        "status": "classified",
+        "appeal_filed": False,
         "attribution": attribution,
         "confidence": confidence,
-        "label": label,
+        "label": label_result["label"],
+        "label_text": label_result["label_text"],
         "signals": {
             "signal_1": {
                 "name": "groq_llm_classification",
@@ -276,6 +305,52 @@ def submit():
                 "reason": stylometric_result.get("reason", "")
             }
         }
+    })
+
+
+@app.route("/appeal", methods=["POST"])
+def appeal():
+    data = request.get_json()
+
+    if not data:
+        return jsonify({"error": "Request body must be JSON."}), 400
+
+    content_id = data.get("content_id")
+    creator_reasoning = data.get("creator_reasoning")
+
+    if not content_id:
+        return jsonify({"error": "Missing required field: content_id"}), 400
+
+    if not creator_reasoning:
+        return jsonify({"error": "Missing required field: creator_reasoning"}), 400
+
+    original_submission = find_latest_submission(content_id)
+
+    if not original_submission:
+        return jsonify({"error": "No submission found for that content_id."}), 404
+
+    appeal_entry = {
+        "event_type": "appeal",
+        "content_id": content_id,
+        "creator_id": original_submission.get("creator_id"),
+        "timestamp": utc_now(),
+        "status": "under_review",
+        "appeal_filed": True,
+        "appeal_reasoning": creator_reasoning,
+        "original_attribution": original_submission.get("attribution"),
+        "original_confidence": original_submission.get("confidence"),
+        "original_label": original_submission.get("label"),
+        "llm_score": original_submission.get("llm_score"),
+        "stylometric_score": original_submission.get("stylometric_score")
+    }
+
+    write_log(appeal_entry)
+
+    return jsonify({
+        "content_id": content_id,
+        "status": "under_review",
+        "appeal_filed": True,
+        "message": "Appeal received. The submission is now under review."
     })
 
 
